@@ -58,9 +58,12 @@ pub struct wfb_rx_meta {
     pub mcs_index: u8,
     pub bandwidth: u8,
     pub antenna: [u8; 4],
-    pub rssi: [i8; 4],
+    pub rssi: [i8; 4], // can be useful for detecting the boundrary nodes in a mesh network. For example
+                       // if RSSI is withing a certain low range it can be assumed that the node is at the edge of the notwork, while high RSSI
+                       // can indicate that we are talking to the neightbouring node
     pub noise: [i8; 4],
-    pub antenna_count: u8,
+    pub antenna_count: u8, // maybe we can modify it to list antennas within the entire network, but also at the three neightbors
+                           // with their ids
     pub truncated: u8,
 }
 
