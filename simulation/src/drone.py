@@ -2,23 +2,17 @@
 
 from copy import Error
 import subprocess
+import numpy as np
 
 # the class containing a group of neightboring drones.
 # @id: the unique id of the cluster of int type
 class Cluster:
-    def __init__(self, id):
-        self.id = id
-        self.nodes = [] # list of all nodes in the cluster. each cluster has between 3 and 5 nodes
+    def __init__(self, id: int):
+        self.id: str = str(id)
+        self.nodes: dict[str, Node] = {} # dict of all nodes in the cluster assigned by id
 
-
-    def get_cluster_by_id(self, id):
-        if self.id == id:
-            return self
-        else:
-            print("cluster not found")
-
-    def add_node(self, node):
-        if node in self.nodes:
+    def add_node(self, node: Node):
+        if node.node_id in self.nodes:
             print("already a node in the cluster")
             return
         
@@ -26,26 +20,25 @@ class Cluster:
             print("maximum number of nodes already reached")
             return
         
-        self.nodes.append(node)
-        
+        self.nodes[node.node_id] = node
         node.cluster_id = self.id
         
         for n in self.nodes:
             if n != node:
-                n.add_neighbor(node)
-                node.add_neighbor(n)
+                self.nodes[n].add_neighbor(node)
+                node.add_neighbor(self.nodes[n])
 
     
-    def remove_node(self, node):
-        if node not in self.nodes:
+    def remove_node(self, node: Node):
+        if node.node_id not in self.nodes:
             print("node is not a current member of the cluster")
             return
 
-        self.nodes.remove(node)
+        del self.nodes[node.node_id]
         node.cluster_id = None
         for n in self.nodes:
-            n.remove_neighbor(node)
-            node.remove_neighbor(n)
+            self.nodes[n].remove_neighbor(node)
+            node.remove_neighbor(self.nodes[n])
 
         if self.nodes.__len__() < 3:
             print("WARNING: not enough drones in the cluster.")
@@ -54,29 +47,32 @@ class Cluster:
 # @id: the unique id of the drone in the mesh of int type
 # @position: initial position of the drone in 3D space represented by the array of 3 floates
 class Node:
-    def __init__ (self, node_id, initial_position):
-        self.node_id = node_id
-        self.cluster_id = None # added when node joins the cluster
-        self.position = initial_position
-        self.neightbors = {} # node_id -> Node
-        self.neightbors_position = {} # node_id -> last recorded position
-        self.neightbors_last_seen = {} # node_id -> last seen time 
+    def __init__ (self, node_id: int, initial_position: list[int, int, int]):
+        self.node_id: str = str(node_id)
+        self.cluster_id: str = None # added when node joins the cluster
+        self.position: list[int, int, int] = initial_position
+        self.neightbors: dict[str, Node] = {} # node_id -> Node
+        self.neightbors_position: dict[str, tuple[int, int, int]] = {} # node_id -> tuple of twolast recorded position for linear position prediction, oldest first
+        self.neightbors_last_seen: dict[str, tuple[float]] = {} # node_id -> two last seen times, older first
 
-        self.time = 0 # for storing when neightbors have been seen for the last time. will be measured by threads that run in the backgroud (global)
+        self.time: float = 0 # for storing when neightbors have been seen for the last time. will be measured by threads that run in the backgroud (global)
 
+        self.lost_distances: dict[str, float] = {}
+
+## Handling drones association and disassociation within one cluster
 
     def add_neighbor(self, neighbor: Node):
 
-        if neighbor in self.neightbors:
+        if neighbor.node_id in self.neightbors:
             print("already a neightbord")
             return
         
-        self.neighbors[neighbor.node_id] = 0
-        self.neighbor_positions[neighbor.node_id] = [0.0, 0.0, 0.0]
-        self.neightbors_last_seen[neighbor.node_id] = 0.0
+        self.neighbors[neighbor.node_id] = neighbor
+        self.neighbor_positions[neighbor.node_id] = tuple([0, 0, 0], [0, 0,0 ])
+        self.neightbors_last_seen[neighbor.node_id] = [0.0, 0.0]
     
-    def remove_neighbor(self, neighbor):
-        if neighbor not in self.neightbors:
+    def remove_neighbor(self, neighbor: Node):
+        if neighbor.node_id not in self.neightbors:
             print("node is not a current neighbor")
             return
 
@@ -84,39 +80,93 @@ class Node:
         self.neighbor_positions.pop(neighbor.node_id, None)
         self.neightbors_last_seen.pop(neighbor.node_id, None)
 
+##Handling message receiving and updating neightbor information
+
     def read_message(self, message: str):
 
         if message.split()[0] != "RECEIVE":
             print("invalid message format")
             return
         
-        message_type = message.split()[1]
-        sender_id = message.split()[2]
+        message_type: str = message.split()[1]
+        sender_id: str = message.split()[2]
+
+        if sender_id in self.neightbors or sender_id == self.node_id:
+            if message_type == "LOST_DRONE":
+                lost_uuid: str = message.split()[3]
+                if lost_uuid == self.node_id:
+                    return
+                print("received lost drone message from node " + sender_id + " about node " + lost_uuid)
+                self.handle_lost(lost_uuid, self.time) # update time to the received time of the message
+
+        if message_type == "ALIVE_PING" and sender_id == self.node_id:
+            sender_position = [float(x) for x in message.split()[3].split(",")]
+            print("received alive ping from node " + sender_id + " at position " + str(sender_position))
+            self.position = sender_position
+            return
 
         if sender_id not in self.neightbors:
             return
 
         if message_type == "ALIVE_PING":
-            sender_position = message.split()[3:6]
+            sender_position: tuple[int, int, int] = [float(x) for x in message.split()[3].split(",")]
             print("received alive ping from node " + sender_id + " at position " + str(sender_position))
+            self.neightbors_position[sender_id].drop(0)
+            self.neightbors_position[sender_id].append(sender_position)
+            self.neightbors_last_seen[sender_id].drop(0)
+            self.neightbors_last_seen[sender_id].append(self.time)
+            return
         elif message_type == "DRONE_MISSING":
-            missing_uuid = message.split()[3]
-            claster_id = message.split()[4]
+            missing_uuid: str = message.split()[3]
+            claster_id: str = message.split()[4]
             print("received drone missing message from node " + sender_id + " about node " + missing_uuid + " in cluster " + claster_id)
+            return
         elif message_type == "LAST_SEEN":
-            missing_uuid = message.split()[3]
-            timestamp = message.split()[4]
-            print("received drone last seen message from node " + sender_id + " about node " + missing_uuid + " last seen at " + timestamp)
+            missing_uuid: str = message.split()[3]
+            timestamp: float = float(message.split()[4])
+            print("received drone last seen message from node " + sender_id + " about node " + missing_uuid + " last seen at " + str(timestamp))
+            return
         else:
             print("message type not found")
             return
 
+## Handling neightboring node lost
+
+    def handle_lost(self, lost_id: str, current_time: float):
+        v_lost: np.ndarray = (np.array(self.neightbors_position[lost_id][0]) - np.array(self.neightbors_position[lost_id][1])) / (self.self.neightbors_last_seen[0] - self.self.neightbors_last_seen[1])
+        dt: float = current_time - self.self.neightbors_last_seen[1]
+        predicted_position: np.ndarray = np.array(self.neightbors_position[lost_id][1]) + v_lost * dt
+        print(self.node_id +": predicted position of the lost drone " + lost_id + " is " + str(predicted_position))
+
+    # calculate the average distance from the drone to the missing neigthbour based on the array of distances provided by other neightbors
+    def find_closest(self, predicted_positions: dict[str, np.ndarray]):
+
+        distances_from_nodes: dict[str, float] = {}
+
+        av_x: float = sum(x[0] for x in predicted_positions.values()) / len(predicted_positions)
+        av_y: float = sum(x[1] for x in predicted_positions.values()) / len(predicted_positions)
+        av_z: float = sum(x[2] for x in predicted_positions.values()) / len(predicted_positions)
+
+        average_position = [av_x, av_y, av_z]
+
+        distances_from_nodes[self.node_id] = np.linalg.norm(np.array(self.position) - np.array(average_position))
+
+        for node in self.neightbors:
+            difference: np.ndarray = np.array(self.neightbors_position[node][1]) - np.array(average_position)
+            distance = np.linalg.norm(difference)
+            distances_from_nodes[node] = distance
+
+        closest_node: str = min(distances_from_nodes, key=distances_from_nodes.get)
+        if closest_node == self.node_id:
+            print(self.node_id + ": I am the closest node. I'll move to the avergage position to heal the mesh")
+            self.position = np.array(average_position) / 2
+
 
 if __name__ == "__main__":
 
-    clusters = []
-    nodes = []
-    move = 0
+    clusters: list[Cluster] = []
+    nodes: list[Node] = []
+    move: int = 0
 
     for i in range(1, 10):
         node = Node(i, [0.0, 0.0, 0.0])
