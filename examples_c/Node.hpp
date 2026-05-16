@@ -99,7 +99,7 @@ struct NeighbourResponse {
     general.type = commandtype::NEIGHBOUR_RESPONSE_ALIVE;
     std::vector<uint8_t> base = general.toMessage();
     std::vector<uint8_t> time = serialize_time_to_vector(thirdLastSeen);
-    base.insert(base.begin(), time.begin(), time.end());
+    base.insert(base.end(), time.begin(), time.end());
     return base;
   }
   void BuildFromVector(std::vector<uint8_t> data) {
@@ -162,18 +162,28 @@ struct NeigbourRequest {
 };
 
 struct EdgeDrone {
+  std::chrono::time_point<std::chrono::steady_clock> start;
+  uint64_t getTimeSinceStart() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               (std::chrono::steady_clock::now() - start))
+        .count();
+  }
+  std::vector<uint8_t> neighbours;
   std::chrono::time_point<std::chrono::steady_clock> last_ping_sent;
   // drone info
   uint8_t group_uuid;
   Vector3 position;
+  Vector3 velocity{1 * 0.005, 1 * 0.005, 0};
   uint8_t uuid;
   std::unordered_map<uint8_t,
                      std::chrono::time_point<std::chrono::steady_clock>>
       neighbours_timeout;
-
   std::unordered_map<uint8_t,
                      std::chrono::time_point<std::chrono::steady_clock>>
       neighbours_missing_sent;
+  std::unordered_map<uint8_t,
+                     std::chrono::time_point<std::chrono::steady_clock>>
+      neighbours_missing_blocked;
   std::unordered_map<uint8_t, Vector3> neighbours_lastping;
   uint8_t internal_uuid;
   std::chrono::time_point<std::chrono::steady_clock> internal_last_msg;
@@ -188,7 +198,8 @@ struct EdgeDrone {
   std::vector<uint8_t> BuildAlivePing(bool logging) {
     if (logging)
       std::cout << std::to_string(uuid) << " " << position[0] << ","
-                << position[1] << "," << position[2] << std::endl;
+                << position[1] << "," << position[2] << " "
+                << getTimeSinceStart() << std::endl;
     AliveBroadcast ab;
     General general;
     general.sender_position = position;
@@ -202,7 +213,8 @@ struct EdgeDrone {
   std::vector<uint8_t> BuildDroneMissing(uint8_t missing_uuid, bool logging) {
     if (logging)
       std::cout << std::to_string(uuid) << " " << std::to_string(missing_uuid)
-                << " " << std::to_string(group_uuid) << std::endl;
+                << " " << std::to_string(group_uuid) << " "
+                << getTimeSinceStart() << std::endl;
     NeigbourRequest nr;
     General general;
     general.sender_position = position;
@@ -219,11 +231,15 @@ struct EdgeDrone {
       std::cout << std::to_string(ab.general.sender_uuid) << " "
                 << ab.general.sender_position[0] << ","
                 << ab.general.sender_position[1] << ","
-                << ab.general.sender_position[2] << std::endl;
+                << ab.general.sender_position[2] << " " << getTimeSinceStart()
+                << std::endl;
     neighbours_timeout.insert_or_assign(ab.general.sender_uuid,
                                         ab.general.time);
     neighbours_lastping.insert_or_assign(ab.general.sender_uuid,
                                          ab.general.sender_position);
+    auto found = neighbours_missing_sent.find(ab.general.sender_uuid);
+    if (found != neighbours_missing_sent.end())
+      neighbours_missing_sent.erase(ab.general.sender_uuid);
   };
 
   std::vector<uint8_t> ProcessNeighbourRequest(NeigbourRequest nr,
@@ -231,7 +247,8 @@ struct EdgeDrone {
     if (logging)
       std::cout << std::to_string(nr.general.sender_uuid) << " "
                 << std::to_string(nr.missing_uuid) << " "
-                << std::to_string(group_uuid) << std::endl;
+                << std::to_string(group_uuid) << " " << getTimeSinceStart()
+                << std::endl;
     neighbours_timeout.insert_or_assign(nr.general.sender_uuid,
                                         nr.general.time);
     neighbours_lastping.insert_or_assign(nr.general.sender_uuid,
@@ -253,19 +270,25 @@ struct EdgeDrone {
       std::cout << std::to_string(nr.general.sender_uuid) << " "
                 << std::to_string(nr.missing_uuid) << " "
                 << std::chrono::duration_cast<std::chrono::milliseconds>(
-                       nr.thirdLastSeen.time_since_epoch())
+                       nr.thirdLastSeen - start)
                        .count()
-                << std::endl;
+                << " " << getTimeSinceStart() << std::endl;
     neighbours_timeout.insert_or_assign(nr.general.sender_uuid,
                                         nr.general.time);
     neighbours_lastping.insert_or_assign(nr.general.sender_uuid,
                                          nr.general.sender_position);
-    neighbours_missing_sent.erase(nr.missing_uuid);
-    if ((std::chrono::steady_clock::now() - nr.thirdLastSeen).count() < 100) {
-      neighbours_timeout.insert_or_assign(nr.missing_uuid, nr.thirdLastSeen);
+    if (std::chrono::steady_clock::now() <
+        nr.thirdLastSeen + std::chrono::seconds(10)) {
+      auto current = neighbours_timeout.find(nr.missing_uuid);
+      if (current == neighbours_timeout.end())
+        neighbours_timeout.insert_or_assign(nr.missing_uuid, nr.thirdLastSeen);
+      else
+        neighbours_timeout.insert_or_assign(
+            nr.missing_uuid, std::max(nr.thirdLastSeen, current->second));
     } else if (logging)
-      std::cout << "LOST DRONE " << std::to_string(nr.missing_uuid) << " "
-                << std::to_string(uuid) << std::endl;
+      std::cout << "RECEIVE LOST_DRONE " << std::to_string(uuid) << " "
+                << std::to_string(nr.missing_uuid) << " " << getTimeSinceStart()
+                << std::endl;
   }
 };
 
