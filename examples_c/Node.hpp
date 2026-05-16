@@ -6,164 +6,267 @@
 #include <cstdint>
 #include <unordered_map>
 #include <chrono>
+#include <cstring>
+std::vector<uint8_t> serialize_time_to_vector(
+    std::chrono::steady_clock::time_point tp) {
+  using namespace std::chrono;
+
+  auto ticks = tp.time_since_epoch().count();
+
+  std::vector<uint8_t> data(sizeof(ticks));
+  std::memcpy(data.data(), &ticks, sizeof(ticks));
+
+  return data;
+}
+
+std::chrono::steady_clock::time_point deserialize(
+    const std::vector<uint8_t>& data) {
+  using namespace std::chrono;
+
+  steady_clock::rep ticks{};
+
+  if (data.size() != sizeof(ticks)) throw std::runtime_error("invalid size");
+
+  std::memcpy(&ticks, data.data(), sizeof(ticks));
+
+  return steady_clock::time_point{steady_clock::duration{ticks}};
+}
 
 // 4 bit
 enum commandtype : uint8_t {
-  ALIVE = 0u,
-  GETPOS = 1u,
-  NEIGHBOUR_REQ = 2u,
-  NEIGHBOUR_RSP = 3u,
-  ALIVE = 8u,  // position
-  OTHER = 9u
+  ALIVE = 1,
+  NEIGHBOUR_REQUEST_ALIVE = (1 << 1),
+  NEIGHBOUR_RESPONSE_ALIVE = (1 << 2),
+  //   OUT_OF_GROUP_RTS = (1 << 3),
+  //   OUT_OF_GROUP_CTS = (1 << 4)
 };
 
-// 256 + time
 struct General {
-  uint8_t ttl;                      // 8 bits
-  uint8_t sender_uuid;              // 8 bits
-  uint8_t target_uuid;              // 8 bits
-  uint8_t likely_global_direction;  // 8 bits
-  Vector3 sender_position;          // 3 * 32bits
+  uint8_t sender_uuid;
+  uint8_t target_uuid;
+  Vector3 sender_position;
   std::chrono::time_point<std::chrono::steady_clock> time;
-  commandtype type;  // 4 bits
-  uint8_t checksum;  // 4 bits
+  commandtype type;
   std::vector<uint8_t> toMessage() {
-    std::vector<uint8_t> msg{20};
-    msg.emplace_back(ttl);
+    std::vector<uint8_t> msg;
+    msg.emplace_back(type);
     msg.emplace_back(sender_uuid);
     msg.emplace_back(target_uuid);
-    msg.emplace_back(likely_global_direction);
-    // position
-    msg.emplace_back(type << 4 | 1 /* checksum */);
+    uint8_t* pos_pointer = reinterpret_cast<uint8_t*>(sender_position.data);
+    for (int i = 0; i < 3 * sizeof(float); i++) {
+      msg.push_back(pos_pointer[i]);
+    }
+    std::vector<uint8_t> time_vector = serialize_time_to_vector(time);
+    for (uint8_t v : time_vector) {
+      msg.emplace_back(v);
+    }
+    return msg;
   }
 };
 
 // broadcast without target
-struct PositionPacket {
+struct AliveBroadcast {
   General general;
+  void BuildFromVector(std::vector<uint8_t> data) {
+    general.type = commandtype(data[0]);
+    general.sender_uuid = data[1];
+    general.target_uuid = data[2];
+    std::vector<uint8_t> pos;
+    for (int i = 0; i < 3 * sizeof(float); i++) {
+      pos.push_back(data[i + 3]);
+    }
+    float* vec = reinterpret_cast<float*>(pos.data());
+    general.sender_position = Vector3(vec[0], vec[1], vec[2]);
+    std::vector<uint8_t> time;
+    for (int i = 0;
+         i < sizeof(std::chrono::time_point<std::chrono::steady_clock>); i++) {
+      time.push_back(data[i + 3 + 3 * sizeof(float)]);
+    }
+    general.time = deserialize(time);
+  }
+  std::vector<uint8_t> BuildMessage() {
+    general.type = commandtype::ALIVE;
+    return general.toMessage();
+  }
 };
 
 // who are your neighbours
 struct NeighbourResponse {
   General general;
-  std::vector<uint8_t> uuids;        // n * 8
-  std::vector<uint8_t> other_close;  // m * 8
-  std::vector<Vector3> positions;    // n * 32
-};
-
-class Node {
- public:
-  // information from ins/gps/flight controller
-  Vector3 position;
-  uint8_t uuid;  // 8 bits
-  std::unordered_map<uint8_t, Vector3> tier1{};
-  float currentDistance = 0;
-
-  // alive responses
-  bool isWaitingAlive;
-  std::chrono::time_point<std::chrono::steady_clock> endWaitingAliveTime;
-  std::vector<PositionPacket> alive_response;
-
-  void sendAlivePacket() {
-    std::vector<uint8_t> b = BuildAlivePacket();
-    // set radioheader
-    // send packet
-    (void)b;
-    // set state
-    isWaitingAlive = true;
-    endWaitingAliveTime =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
-  }
-
-  // later increasing size based on neighbours
-  std::vector<uint8_t> BuildAlivePacket() {
-    General g{};
-    g.type = commandtype::ALIVE;
-    g.ttl = 1;                      // for now
-    g.likely_global_direction = 0;  // all
-    g.sender_position = position;
-    g.sender_uuid = uuid;
-    g.target_uuid = 0;  // any
-    g.time = std::chrono::steady_clock::now();
-    return g.toMessage();
-  }
-
-  uint8_t GetDirection(uint8_t target) {
-    // 4 directions
-    Vector3 target_pos = tier1.find(target)->second;
-    if (target_pos.data[0] > position.data[0]) {
-      if (target_pos.data[1] > position.data[1])
-        return 1;
-      else
-        return 2;
-    } else {
-      if (target_pos.data[1] > position.data[1])
-        return 3;
-      else
-        return 4;
-    }
-  }
-
-  std::vector<uint8_t> BuildNeighbourRequest(uint8_t target) {
-    General g{};
-    g.type = commandtype::NEIGHBOUR_REQ;
-    g.ttl = 1;
-    g.likely_global_direction = GetDirection(target);
-    g.sender_position = position;
-    g.sender_uuid = uuid;
-    g.target_uuid = target;
-    g.time = std::chrono::steady_clock::now();
-    return g.toMessage();
-  }
-
-  std::vector<uint8_t> BuildNeighbourResponse(uint8_t from) {
-    General g{};
-    g.type = commandtype::NEIGHBOUR_RSP;
-    g.ttl = 2;
-    g.likely_global_direction = GetDirection(from);
-    g.sender_position = position;
-    g.sender_uuid = uuid;
-    g.target_uuid = from;
-    g.time = std::chrono::steady_clock::now();
-    NeighbourResponse res;
-    res.general = g;
-    std::vector<uint8_t> base = g.toMessage();
-    for (auto k : tier1) {
-      base.push_back(k.first);
-      uint8_t* pos = reinterpret_cast<uint8_t*>(&k.second);
-      for (int i = 0; i < 4; i++) {
-        base.push_back(pos[i]);
-      }
-    }
+  uint8_t missing_uuid;
+  std::chrono::time_point<std::chrono::steady_clock> thirdLastSeen;
+  std::vector<uint8_t> BuildMessage() {
+    general.type = commandtype::NEIGHBOUR_RESPONSE_ALIVE;
+    std::vector<uint8_t> base = general.toMessage();
+    std::vector<uint8_t> time = serialize_time_to_vector(thirdLastSeen);
+    base.insert(base.begin(), time.begin(), time.end());
     return base;
   }
-
-  void Process() {
-    if (endWaitingAliveTime > std::chrono::steady_clock::now()) {
-      isWaitingAlive = false;
-      if (alive_response.size() < 16) {
-        currentDistance += 10;
-        sendAlivePacket();
-      }
+  void BuildFromVector(std::vector<uint8_t> data) {
+    general.type = commandtype(data[0]);
+    general.sender_uuid = data[1];
+    general.target_uuid = data[2];
+    std::vector<uint8_t> pos;
+    for (int i = 0; i < 3 * sizeof(float); i++) {
+      pos.push_back(data[i + 3]);
     }
-    OnReceivingAckPosition();
+    float* vec = reinterpret_cast<float*>(pos.data());
+    general.sender_position = Vector3(vec[0], vec[1], vec[2]);
+    std::vector<uint8_t> time;
+    for (int i = 0;
+         i < sizeof(std::chrono::time_point<std::chrono::steady_clock>); i++) {
+      time.push_back(data[i + 3 + 3 * sizeof(float)]);
+    }
+    general.time = deserialize(time);
+    std::vector<uint8_t> other_time;
+    for (int i = 0;
+         i < sizeof(std::chrono::time_point<std::chrono::steady_clock>); i++) {
+      other_time.push_back(
+          data[i + 3 + 3 * sizeof(float) +
+               sizeof(std::chrono::time_point<std::chrono::steady_clock>)]);
+    }
+    general.time = deserialize(time);
+    thirdLastSeen = deserialize(other_time);
+    missing_uuid =
+        data[3 + 3 * sizeof(float) +
+             2 * sizeof(std::chrono::time_point<std::chrono::steady_clock>)];
+  }
+};
+
+struct NeigbourRequest {
+  General general;
+  uint8_t missing_uuid;
+  void BuildFromVector(std::vector<uint8_t> data) {
+    general.type = commandtype(data[0]);
+    general.sender_uuid = data[1];
+    general.target_uuid = data[2];
+    std::vector<uint8_t> pos;
+    for (int i = 0; i < 3 * sizeof(float); i++) {
+      pos.push_back(data[i + 3]);
+    }
+    float* vec = reinterpret_cast<float*>(pos.data());
+    general.sender_position = Vector3(vec[0], vec[1], vec[2]);
+    std::vector<uint8_t> time;
+    for (int i = 0;
+         i < sizeof(std::chrono::time_point<std::chrono::steady_clock>); i++) {
+      time.push_back(data[i + 3 + 3 * sizeof(float)]);
+    }
+    general.time = deserialize(time);
+  }
+  std::vector<uint8_t> BuildMessage() {
+    general.type = commandtype::NEIGHBOUR_REQUEST_ALIVE;
+    auto tmp = general.toMessage();
+    tmp.push_back(missing_uuid);
+    return tmp;
+  }
+};
+
+struct EdgeDrone {
+  std::chrono::time_point<std::chrono::steady_clock> last_ping_sent;
+  // drone info
+  uint8_t group_uuid;
+  Vector3 position;
+  uint8_t uuid;
+  std::unordered_map<uint8_t,
+                     std::chrono::time_point<std::chrono::steady_clock>>
+      neighbours_timeout;
+
+  std::unordered_map<uint8_t,
+                     std::chrono::time_point<std::chrono::steady_clock>>
+      neighbours_missing_sent;
+  std::unordered_map<uint8_t, Vector3> neighbours_lastping;
+  uint8_t internal_uuid;
+  std::chrono::time_point<std::chrono::steady_clock> internal_last_msg;
+  // antenna info
+  const char* iface;
+  uint8_t rx_ignore_self_injected;
+  uint32_t rx_ring_size;
+  uint32_t stream_id;
+  uint8_t bandwidth;
+  uint32_t internal_stream_id;
+
+  std::vector<uint8_t> BuildAlivePing(bool logging) {
+    if (logging)
+      std::cout << std::to_string(uuid) << " " << position[0] << ","
+                << position[1] << "," << position[2] << std::endl;
+    AliveBroadcast ab;
+    General general;
+    general.sender_position = position;
+    general.sender_uuid = uuid;
+    general.target_uuid = 0x0;
+    general.time = std::chrono::steady_clock::now();
+    ab.general = general;
+    return ab.BuildMessage();
   }
 
-  void OnReceivingAckPosition(uint8_t uuid_, Vector3 pos) {
-    if (!isWaitingAlive) return;
-    tier1.insert_or_assign(uuid_, pos);
-  }
-  void OnReceivingPositioning(uint8_t uuid_, Vector3 pos) {
-    tier1.insert_or_assign(uuid_, pos);
+  std::vector<uint8_t> BuildDroneMissing(uint8_t missing_uuid, bool logging) {
+    if (logging)
+      std::cout << std::to_string(uuid) << " " << std::to_string(missing_uuid)
+                << " " << std::to_string(group_uuid) << std::endl;
+    NeigbourRequest nr;
+    General general;
+    general.sender_position = position;
+    general.sender_uuid = uuid;
+    general.target_uuid = 0x0;
+    general.time = std::chrono::steady_clock::now();
+    nr.general = general;
+    nr.missing_uuid = missing_uuid;
+    return nr.BuildMessage();
   }
 
-  void OnReceivingNeighbourReq(uint8_t uuid_) {
-    auto msg = BuildNeighbourResponse(uuid_);
-    // send message at current distance
+  void ProcessAliveBroadcast(AliveBroadcast ab, bool logging) {
+    if (logging)
+      std::cout << std::to_string(ab.general.sender_uuid) << " "
+                << ab.general.sender_position[0] << ","
+                << ab.general.sender_position[1] << ","
+                << ab.general.sender_position[2] << std::endl;
+    neighbours_timeout.insert_or_assign(ab.general.sender_uuid,
+                                        ab.general.time);
+    neighbours_lastping.insert_or_assign(ab.general.sender_uuid,
+                                         ab.general.sender_position);
+  };
+
+  std::vector<uint8_t> ProcessNeighbourRequest(NeigbourRequest nr,
+                                               bool logging) {
+    if (logging)
+      std::cout << std::to_string(nr.general.sender_uuid) << " "
+                << std::to_string(nr.missing_uuid) << " "
+                << std::to_string(group_uuid) << std::endl;
+    neighbours_timeout.insert_or_assign(nr.general.sender_uuid,
+                                        nr.general.time);
+    neighbours_lastping.insert_or_assign(nr.general.sender_uuid,
+                                         nr.general.sender_position);
+    NeighbourResponse response;
+    response.missing_uuid = nr.missing_uuid;
+    response.thirdLastSeen = neighbours_timeout.at(nr.missing_uuid);
+    General general;
+    general.sender_position = position;
+    general.sender_uuid = uuid;
+    general.target_uuid = nr.general.sender_uuid;
+    general.time = std::chrono::steady_clock::now();
+    response.general = general;
+    return response.BuildMessage();
   }
 
-  // later
-  void OnCacheTimeout() {}
+  void ProcessNeighbourResponse(NeighbourResponse nr, bool logging) {
+    if (logging)
+      std::cout << std::to_string(nr.general.sender_uuid) << " "
+                << std::to_string(nr.missing_uuid) << " "
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       nr.thirdLastSeen.time_since_epoch())
+                       .count()
+                << std::endl;
+    neighbours_timeout.insert_or_assign(nr.general.sender_uuid,
+                                        nr.general.time);
+    neighbours_lastping.insert_or_assign(nr.general.sender_uuid,
+                                         nr.general.sender_position);
+    neighbours_missing_sent.erase(nr.missing_uuid);
+    if ((std::chrono::steady_clock::now() - nr.thirdLastSeen).count() < 100) {
+      neighbours_timeout.insert_or_assign(nr.missing_uuid, nr.thirdLastSeen);
+    } else if (logging)
+      std::cout << "LOST DRONE " << std::to_string(nr.missing_uuid) << " "
+                << std::to_string(uuid) << std::endl;
+  }
 };
 
 #endif
