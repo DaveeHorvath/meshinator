@@ -1,201 +1,177 @@
-# wfb_rs
+# Meshinator
 
-Rust-only plaintext framing implementation:
+> *Like mycelium, the network doesn't break — it grows around the wound.*
 
-- synthetic IEEE802.11 header injection (stream-id embedded in addr2/addr3)
-- HT radiotap TX header template
-- pcap capture + radiotap parsing (metadata best-effort)
-- plaintext payload framing (`WFB_PROTO_VERSION = 0`)
+**Autonomous mesh intelligence for tactical drone swarms**  
+*Evil Incorporated — Junction x Aalto Defence Hackathon 2026*
 
-## Terminology
+---
 
-Two different "channel" concepts, do not confuse:
+## The Problem
 
-- **Wifi channel** — physical RF channel (e.g. `36`, `52`). Set on the NIC out-of-band with `iw dev … set channel`. wfb_rs does not touch it.
-- **`stream_id`** — a 32-bit logical demux tag baked into the synthetic 802.11 addr2/addr3 MACs as `57:42:<stream_id big-endian>`. Lets multiple independent wfb streams share the same RF channel; RX drops frames whose embedded `stream_id` does not match.
+Modern drone systems rely on a fragile star topology: each drone maintains a peer-to-peer connection to a single controller or command-and-control (C2) node. Lose that link — through jamming, signal attenuation, or physical loss of a node — and the entire swarm goes dark.
 
-Two peers must agree on **both** the wifi channel and the `stream_id` to exchange traffic.
+Off-the-shelf mesh solutions are either too expensive to fit the economics of modern autonomous systems, or too naive to survive contested electromagnetic environments. We needed something else.
 
-## Runtime prerequisites
+---
 
-1. A `wlan*` interface capable of monitor mode (required for both TX injection and RX).
-2. Privileges for raw sockets / packet capture: `CAP_NET_RAW` and `CAP_NET_ADMIN`. Either run with `sudo`, or grant caps to the built binary:
+## The Solution: Meshinator
 
-   ```bash
-   sudo setcap cap_net_raw,cap_net_admin=eip ./target/debug/examples/simple_txrx
-   ```
+Meshinator replaces the fragile hub-and-spoke topology with a **two-tier nested cluster architecture** inspired by how biological systems — mycelium networks, immune systems, ant colonies — self-heal without any central coordinator.
 
-   (Caps are stripped on every rebuild — re-apply after `cargo build`.)
-3. The capture interface must produce `DLT_IEEE802_11_RADIO` packets.
-4. Plaintext framing only — FEC/encryption are intentionally deferred.
+Drones organise into **peer clusters of 3–5 units**, each member mutually responsible for its neighbours. These clusters in turn connect into **clusters of clusters**, forming a scalable, resilient mesh that degrades gracefully under pressure.
 
-## System dependencies
+---
+
+## How It Works
+
+### Layer 1 — Intra-Cluster: The Witness Protocol
+
+Every drone in a cluster continuously exchanges **alive-ping** messages with its peers. If a node stops receiving pings from a neighbour, it doesn't immediately declare it lost. Instead, it broadcasts a query to the rest of the cluster:
+
+> *"Can you still see node X?"*
+
+Neighbours respond with when they last observed node X. If the consensus is that node X has been silent too long, the cluster:
+
+1. **Declares node X missing**
+2. **Estimates its predicted last position** based on trajectory and last known coordinates
+3. **Dispatches the closest available drone** from the cluster to move into the gap between the missing node and the rest — bridging the broken link and restoring mesh connectivity
+
+This is the **biomimetic witness protocol**: distributed fault detection through peer consensus, without any central authority.
+
+### Layer 2 — Inter-Cluster: Cluster-of-Clusters
+
+The same witness logic is applied at a higher level. Clusters themselves send health signals to one another. If a cluster loses too many members to remain viable, neighbouring clusters detect the degradation and trigger **disassociation and reassociation**:
+
+- Surviving drones regroup across former cluster boundaries
+- New clusters of the correct size (3–5 members) reform automatically
+- The swarm restructures itself into a healthy topology without operator intervention
+
+### The Healing Behaviour (Simulation Demo)
+
+The Python simulation demonstrates this end-to-end. When a node is reported missing:
+
+- Other nodes read the missing-drone event from the shared message bus
+- The closest available drone calculates an intercept position — the midpoint between itself and the last known location of the missing node
+- It repositions to that bridging point
+- The missing drone, now within radio range again, can resume pinging and re-enters the mesh
+
+---
+
+## Architecture
+
+```
+Controller
+    │
+    └── Cluster of Clusters
+            ├── Cluster A  [drone 1 ── drone 2 ── drone 3]
+            ├── Cluster B  [drone 4 ── drone 5 ── drone 6]
+            └── Cluster C  [drone 7 ── drone 8 ── drone 9]
+```
+
+Each cluster maintains full mesh connectivity internally. Inter-cluster links connect cluster representatives. Loss of any single node or link triggers autonomous healing at the appropriate layer.
+
+---
+
+## Key Features
+
+| Feature | Description |
+|---|---|
+| **Biomimetic witness protocol** | Distributed consensus-based node fault detection — no single point of failure in the decision loop |
+| **Autonomous bridging** | Missing nodes trigger automatic repositioning of a healthy drone to restore the link |
+| **Two-tier nested clustering** | Scalable from a handful of drones to large swarms without architectural changes |
+| **Cluster reassociation** | When clusters lose members, survivors regroup into valid-sized clusters automatically |
+| **Real-time mesh overlay dashboard** | Live visualisation of node positions, health status, packet statistics, and event feed |
+| **Jamming resilience** | No reliance on a single uplink; swarm can operate and self-coordinate with a degraded or absent C2 link |
+
+---
+
+## Implementation
+
+### Transmission Layer
+Raw IEEE 802.11 frames via packet-injection-capable USB Wi-Fi adapters, using the `kova-wfb-rs` library (Rust core, Python bindings) (IMPORTANT: WE DID NOT WRITE ANY RUST!). Custom radiotap headers for signal metadata.
+
+### Mesh Layer
+Python simulation with a `Cluster` and `Node` abstraction. Each node runs an independent message loop, reads events from peers, maintains a neighbour registry with last-seen timestamps, and participates in witness queries.
+
+### Application Layer
+- **MeshOps Tactical Dashboard** — real-time web UI showing mesh topology, node registry, packet statistics, active/missing/down state, and a live event feed
+- **Autonomous healing logic** — `mesh_healing.py` handles bridging drone dispatch; `mesh_restructure.py` handles reassociation events
+
+### Repository Structure
+
+```
+meshinator/
+├── simulation/
+│   └── src/
+│       ├── drone.py            # Node class, message loop, witness protocol
+│       ├── mesh_healing.py     # Bridging drone dispatch logic
+│       ├── mesh_restructure.py # Cluster reassociation logic
+│       └── examples/           # Topology input files (0.toml, 1.toml, 2.toml)
+├── src/                        # C/Rust radio transmission layer
+│   ├── main.cpp
+│   └── Node.hpp
+└── thirdparty/                 # kova-wfb-rs bindings
+```
+
+---
+
+## Running the Simulation
 
 ```bash
-sudo apt install libpcap-dev
+cd simulation
+python -m venv myenv && source myenv/bin/activate
+pip install -r requirements.txt
 ```
 
-## Putting an interface into monitor mode
+Each `.toml` file defines a node's ID, initial position, and cluster membership. Nodes communicate via local sockets in simulation mode, and via raw Wi-Fi frames in hardware mode.
 
-```bash
-iw dev              # list network interfaces
-ethtool -i wlan1    # print attached driver, kernel version (should be rtl88xxau_wfb)
+---
 
-NIC=wlan1           # adjust
+## The Dashboard
 
-sudo nmcli dev set "$NIC" managed no
-sudo ip link set "$NIC" down
-sudo iw dev "$NIC" set type monitor
-sudo ip link set "$NIC" up
-sudo iw dev "$NIC" set channel 36 HT20 # = WiFi ch 36, High Throughput, 20MHz wide
-sudo iw dev "$NIC" set power_save off
+The **MeshOps Tactical Dashboard** provides a real-time operator view of the mesh:
 
-iw dev "$NIC" info        # verify type=monitor, channel set
-```
+- **Mesh topology map** — live node positions with active/missing/down colour coding
+- **Node details panel** — per-node position (X, Y, Z), packet sent/received/total counters, last-seen timestamp
+- **Node registry table** — fleet-wide status at a glance
+- **Event feed** — timestamped log of all ping events, missing declarations, and healing actions
+- **Fleet metrics** — active nodes, missing nodes, down nodes, total packets, packets/min
 
-Both peers must be on the same wifi channel.
+Supports both **Mock** (simulated data stream) and **Live** (real hardware) modes.
 
-## Build
+---
 
-```bash
-cargo build                 # library only (rlib + cdylib + staticlib)
-cargo build --examples      # also builds simple_txrx and bandwidth binaries
-cargo build --release       # release artifacts
-```
+## Future Directions
 
-Example binaries land in `target/debug/examples/` (or `target/release/examples/`). Library artifacts land in `target/{debug,release}/`:
+- **Dynamic cluster reassociation** — clusters are configured at launch but can autonomously rebalance mid-mission as the swarm spreads or contracts
+- **Improved inter-cluster communication** — dedicated cluster-head election and optimised cross-cluster routing
+- **Positional overlays** — integrating GPS/IMU data from the swarm into the dashboard for mission planning and visualisation
+- **Encryption layer** — end-to-end authenticated frames to resist spoofing in adversarial RF environments
 
-- `libwfb_rs.rlib`
-- `libwfb_rs.a`
-- `libwfb_rs.so`
+---
 
-If `CARGO_TARGET_DIR` is set, outputs go under `$CARGO_TARGET_DIR/...` instead.
+## Built With
 
-## Examples
+- **Python 3** — simulation, mesh logic, healing and restructure algorithms
+- **Rust / C** — low-level radio transmission using library provided by `kova-wfb-rs`
+- **IEEE 802.11 raw frames** — packet injection for infrastructure-free communication
+- **React / Next.js** — MeshOps tactical dashboard
 
-The two example invocation styles are equivalent — pick one:
+---
 
-- `cargo run --example <name> -- <args>` — builds and runs in one step. Awkward with `sudo` as it'll pollute `target/` ownership.
-- `sudo ./target/debug/examples/<name> <args>` — run the prebuilt binary (after `cargo build --examples`).
+## Hardware
 
-### `simple_txrx` — interactive stdin chat
+Each node runs on a device equipped with a packet-injection-capable USB Wi-Fi adapter (provided by Kova Labs). The same codebase runs in simulation (sockets) and on hardware (raw 802.11 frames) with a single config change.
 
-Both TX and RX on a single interface. Frames it injects itself are filtered out of its RX (`ignore_self_injected: true`), so to see anything received you need a **second peer** running the same example on the same wifi channel and `stream_id`.
+---
 
-On each peer:
-```bash
-sudo ./target/debug/examples/simple_txrx --iface "$NIC" --stream-id 1
-```
+## About Evil Incorporated
 
-Then type a line on peer A's stdin — it appears as `RX seq=… payload="…"` on peer B.
+*We have a button for that.*
 
-Flags:
+Built at **Junction x Aalto Defence Hackathon 2026** in response to the Kova Labs challenge: build a tactical mesh communication system from the ground up, using low-power radio hardware, for autonomous drone coordination in contested environments.
 
-- `-m data` (default) | `-m rts` — synthetic frame subtype
-- `--print-rssi` — include radiotap RSSI in RX output
-- `-c` accepts hex (`0x1234`) or decimal
+---
 
-### `bandwidth` — self-generating throughput test
-
-Separate `--role tx` and `--role rx` processes on two peers. The TX side generates payload on its own (no stdin).
-
-Receiver:
-
-```bash
-sudo ./target/debug/examples/bandwidth --role rx --iface "$NIC" --stream-id 1
-```
-
-Sender:
-
-```bash
-sudo ./target/debug/examples/bandwidth --role tx --iface "$NIC" --stream-id 1
-```
-
-Useful knobs:
-
-- `--payload-size` (default `1200`)
-- `--tx-interval-us` (default `0`, as fast as possible)
-- `--report-ms` (default `1000`)
-
-## Sniffing wfb_rs traffic with tcpdump
-
-wfb_rs-injected frames carry a fixed addr2/addr3 of `57:42:<stream_id big-endian>`. For `--stream-id 1` that's `57:42:00:00:00:01`:
-
-```bash
-sudo tcpdump -i "$NIC" -y IEEE802_11_RADIO -nn -e -vvv 'wlan addr2 57:42:00:00:00:01'
-```
-
-To see all wfb_rs traffic regardless of `stream_id`, drop the filter and grep visually for addr2 starting `57:42:` — tcpdump's BPF for `wlan[N:M]` indexing on radiotap captures is not reliable across versions.
-
-```bash
-sudo tcpdump -y IEEE802_11_RADIO -nn -e -vvv 'wlan[10:2] = 0x5742'
-```
-
-## C ABI
-
-Public C ABI declarations live in `include/wfb_rs.h`. Regenerate with `cbindgen`:
-
-```bash
-make gen-header
-# install cbindgen if missing:
-cargo install cbindgen
-```
-
-Build and link the C smoke binaries:
-
-```bash
-make c-smoke
-```
-
-This produces:
-
-- `examples_c/smoke_shared` (links `libwfb_rs.so`)
-- `examples_c/smoke_static` (links `libwfb_rs.a`)
-
-Minimal manual link:
-
-```bash
-# shared
-cc -O2 -Wall -Wextra -Iinclude -o smoke_shared examples_c/smoke.c \
-   -L"${CARGO_TARGET_DIR:-target}/release" -lwfb_rs
-
-# static
-cc -O2 -Wall -Wextra -Iinclude -o smoke_static examples_c/smoke.c \
-   "${CARGO_TARGET_DIR:-target}/release/libwfb_rs.a" -lpcap -ldl -lpthread -lm
-```
-
-### ABI stability
-
-Minimal v1 ABI: opaque TX/RX handles plus lifecycle/send/recv calls. Intentionally narrow; future extensions should be additive.
-
-## Python bindings (ctypes)
-
-Standalone bindings under `python/`, loaded over `libwfb_rs.so` via `ctypes`.
-
-```bash
-cargo build --release
-python -m venv .venv
-source .venv/bin/activate
-pip install -e python
-```
-
-If the loader cannot find the shared library, point it explicitly:
-
-```bash
-export WFB_RS_LIB_PATH=/absolute/path/to/libwfb_rs.so
-```
-
-Usage:
-
-```python
-from wfb_rs_py import Tx, Rx
-
-with Tx(iface="wlan0", stream_id=1) as tx:
-    tx.send(b"hello", seq=1)
-
-with Rx(iface="wlan0", stream_id=1) as rx:
-    maybe_frame = rx.recv_optional(timeout_ms=100)
-    if maybe_frame is not None:
-        payload, meta = maybe_frame
-        print(payload, meta.seq)
-```
+*Meshinator — because the network doesn't break. It grows around the wound.*
