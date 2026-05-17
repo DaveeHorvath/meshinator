@@ -1,0 +1,269 @@
+#include <string>
+#include <sys/epoll.h>
+#include "Node.hpp"
+#include <toml++/toml.hpp>
+#include <unistd.h>
+
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <thread>
+void RunExternalSimulated(EdgeDrone drone);
+#pragma region config
+
+struct EdgeDroneConfig {
+  EdgeDrone drone{};
+  std::string iface_storage;
+};
+static uint8_t read_u8(const toml::table& tbl, const char* key) {
+  auto value = tbl[key].value<int64_t>();
+  if (!value)
+    throw std::runtime_error(std::string("Missing or invalid uint8_t field: ") +
+                             key);
+
+  return static_cast<uint8_t>(*value);
+}
+
+static std::vector<uint8_t> read_u8_neighbours(const toml::table& tbl,
+                                               const char* key) {
+  std::vector<uint8_t> result;
+
+  const auto* arr = tbl[key].as_array();
+
+  if (!arr)
+    throw std::runtime_error(std::string("missing or invalid array: ") + key);
+
+  result.reserve(arr->size());
+
+  for (const auto& node : *arr) {
+    auto value = node.value<int64_t>();
+
+    if (!value)
+      throw std::runtime_error(std::string("non-integer value in: ") + key);
+
+    if (*value < 0 || *value > 255)
+      throw std::runtime_error(std::string("uint8_t out of range in: ") + key);
+
+    result.push_back(static_cast<uint8_t>(*value));
+  }
+
+  return result;
+}
+
+static uint32_t read_u32(const toml::table& tbl, const char* key) {
+  auto value = tbl[key].value<int64_t>();
+  if (!value)
+    throw std::runtime_error(
+        std::string("Missing or invalid uint32_t field: ") + key);
+
+  return static_cast<uint32_t>(*value);
+}
+
+static float read_float(const toml::table& tbl, const char* key) {
+  auto value = tbl[key].value<double>();
+  if (!value)
+    throw std::runtime_error(std::string("Missing or invalid float field: ") +
+                             key);
+
+  return static_cast<float>(*value);
+}
+
+EdgeDroneConfig load_edge_drone_config(const std::string& path) {
+  auto config = toml::parse_file(path);
+
+  auto* edge = config["edge_drone"].as_table();
+  if (!edge) throw std::runtime_error("Missing [edge_drone] section");
+
+  EdgeDroneConfig result;
+
+  result.drone.group_uuid = read_u8(*edge, "group_uuid");
+  result.drone.uuid = read_u8(*edge, "uuid");
+
+  result.iface_storage = edge->get("iface")->value_or<std::string>("");
+
+  result.drone.iface = result.iface_storage.c_str();
+
+  result.drone.rx_ignore_self_injected =
+      read_u8(*edge, "rx_ignore_self_injected");
+
+  result.drone.rx_ring_size = read_u32(*edge, "rx_ring_size");
+
+  result.drone.stream_id = read_u32(*edge, "stream_id");
+
+  result.drone.bandwidth = read_u8(*edge, "bandwidth");
+
+  auto uuids = read_u8_neighbours(*edge, "group");
+  for (uint8_t uuid : uuids) {
+    result.drone.neighbours_timeout.insert_or_assign(
+        uuid, std::chrono::steady_clock::now());
+    result.drone.neighbours_lastping.insert_or_assign(uuid, Vector3(0, 0, 0));
+  }
+  result.drone.neighbours = uuids;
+
+  result.drone.internal_uuid = read_u8(*edge, "internal_uuid");
+
+  result.drone.internal_stream_id = read_u32(*edge, "internal_stream_id");
+
+  auto* pos = edge->get("position")->as_table();
+  if (!pos) throw std::runtime_error("Missing [edge_drone.position] section");
+
+  result.drone.position[0] = read_float(*pos, "x");
+  result.drone.position[1] = read_float(*pos, "y");
+  result.drone.position[2] = read_float(*pos, "z");
+
+
+  auto* velocity = edge->get("velocity")->as_table();
+  if (!velocity) throw std::runtime_error("Missing [edge_drone.velocity] section");
+
+  result.drone.velocity[0] = read_float(*velocity, "x");
+  result.drone.velocity[1] = read_float(*velocity, "y");
+  result.drone.velocity[2] = read_float(*velocity, "z");
+
+  return result;
+}
+#pragma endregion
+bool simulated = true;
+bool logging = true;
+
+int main(int argc, char* argv[]) {
+  std::string config_path = "./1.toml";
+  if (argc == 3) {
+    if (std::string(argv[1]) == "--logging") {
+      logging = true;
+    } else {
+      config_path = std::string(argv[1]);
+    }
+    config_path = std::string(argv[2]);
+  }
+  EdgeDrone drone;
+  try {
+    auto cfg = load_edge_drone_config(config_path);
+
+    std::cout << "UUID: " << static_cast<int>(cfg.drone.uuid) << '\n';
+    std::cout << "Position: " << cfg.drone.position[0] << ", "
+              << cfg.drone.position[1] << ", " << cfg.drone.position[2] << '\n';
+    drone = cfg.drone;
+  } catch (const std::exception& e) {
+    std::cerr << "Config error: " << e.what() << '\n';
+    return 1;
+  }
+  if (simulated)
+    RunExternalSimulated(drone);
+}
+
+void WriteToUuid(uint8_t uuid, uint8_t* payload, size_t len) {
+  std::string file = "infile" + std::to_string(uuid) + ".txt";
+  FILE* f = fopen(file.c_str(), "a");
+  if (f == NULL) {
+    std::cerr << "Failed to open file\n";
+  }
+  write(fileno(f), payload, len);
+}
+
+int ReadWithTimeout(uint8_t* pos, int fi, size_t bufsize) {
+  auto bytesize = read(fi, pos, bufsize);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  return bytesize;
+}
+
+void RunExternalSimulated(EdgeDrone drone) {
+  drone.start = std::chrono::steady_clock::now();
+  const std::string file = "infile" + std::to_string(drone.uuid) + ".txt";
+  std::ofstream create(file);
+  FILE* f = fopen(file.c_str(), "r");
+  if (f == NULL) {
+    std::cerr << "Failed to open file\n";
+  }
+
+  // Start at end of existing file
+  while (true) {
+    std::vector<uint8_t> buffer;
+    buffer.resize(1024);
+    auto bytes = ReadWithTimeout(buffer.data(), fileno(f), 1024);
+    // process some meta stuff for next request
+    // for now all meta information gets set on startup so its all synced
+    drone.position = drone.position + drone.velocity;
+    if (bytes > 0) {
+      if (buffer[0] == commandtype::ALIVE) {
+        if (logging) {
+          std::cout << "RECEIVING ALIVE_PING ";
+        }
+        AliveBroadcast ab;
+        ab.BuildFromVector(buffer);
+        drone.ProcessAliveBroadcast(ab, logging);
+      }
+      if (buffer[0] == commandtype::NEIGHBOUR_REQUEST_ALIVE) {
+        if (logging) {
+          std::cout << "RECEIVING DRONE_MISSING ";
+        }
+        NeigbourRequest nr;
+        nr.BuildFromVector(buffer);
+        if (logging) {
+          std::cout << "SENDING DRONE_LASTSEEN ";
+        }
+        auto payload = drone.ProcessNeighbourRequest(nr, logging);
+        for (auto& neighbour : drone.neighbours) {
+          WriteToUuid(neighbour, payload.data(), payload.size());
+        }
+      }
+      if (buffer[0] == commandtype::NEIGHBOUR_RESPONSE_ALIVE) {
+        if (logging) {
+          std::cout << "RECEIVING DRONE_LASTSEEN ";
+        }
+        NeighbourResponse nr;
+        nr.BuildFromVector(buffer);
+        drone.ProcessNeighbourResponse(nr, logging);
+      }
+    } else {
+      std::vector<uint8_t> toremove;
+      for (auto it = drone.neighbours_missing_blocked.begin();
+           it != drone.neighbours_missing_blocked.end(); it++) {
+        if (it->second < std::chrono::steady_clock::now()) {
+          toremove.emplace_back(it->first);
+        }
+      }
+      for (auto& k : toremove) {
+        drone.neighbours_missing_blocked.erase(k);
+      }
+      // sending and invalidation
+      if (drone.last_ping_sent + std::chrono::seconds(1) <
+          std::chrono::steady_clock::now()) {
+        if (logging) std::cout << "SENDING ALIVE_PING ";
+        auto payload = drone.BuildAlivePing(logging);
+        for (auto& neighbour : drone.neighbours) {
+          WriteToUuid(neighbour, payload.data(), payload.size());
+        }
+        drone.last_ping_sent = std::chrono::steady_clock::now();
+      }
+
+      for (auto& kv : drone.neighbours_timeout) {
+        if (kv.second + std::chrono::seconds(5) <
+                std::chrono::steady_clock::now() &&
+            drone.neighbours_missing_sent.find(kv.first) ==
+                drone.neighbours_missing_sent.end() &&
+            drone.neighbours_missing_blocked.find(kv.first) ==
+                drone.neighbours_missing_blocked.end()) {
+          if (logging) std::cout << "SENDING DRONE_MISSING ";
+          auto payload = drone.BuildDroneMissing(kv.first, logging);
+          for (auto& neighbour : drone.neighbours) {
+            WriteToUuid(neighbour, payload.data(), payload.size());
+          }
+          drone.neighbours_missing_sent.insert_or_assign(
+              kv.first, std::chrono::steady_clock::now());
+          drone.neighbours_missing_blocked.insert_or_assign(
+              kv.first,
+              std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        }
+      }
+
+      for (auto& kv : drone.neighbours_missing_sent) {
+        if (kv.second + std::chrono::seconds(15) <
+            std::chrono::steady_clock::now()) {
+          std::cout << "GROUP connection fully lost, sleeping"
+                    << drone.getTimeSinceStart() << std::endl;
+          logging = false;
+        }
+      }
+    }
+  }
+}
