@@ -1,0 +1,15 @@
+[edge_drone]
+group_uuid = 1
+uuid = 2
+iface = "eth0"
+rx_ignore_self_injected = 1
+rx_ring_size = 4096
+stream_id = 1001
+bandwidth = 20
+group = [0,1,3,4]
+internal_uuid = 99
+internal_stream_id = 2001
+[edge_drone.position]
+x = 100
+y = 0
+z = 0
