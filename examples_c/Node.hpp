@@ -1,13 +1,11 @@
-#ifndef NODE_HPP
-#define NODE_HPP
-
+#pragma once
 #include <vector>
 #include "Vector3.hpp"
 #include <cstdint>
 #include <unordered_map>
 #include <chrono>
 #include <cstring>
-std::vector<uint8_t> serialize_time_to_vector(
+static std::vector<uint8_t> serialize_time_to_vector(
     std::chrono::steady_clock::time_point tp) {
   using namespace std::chrono;
 
@@ -19,7 +17,7 @@ std::vector<uint8_t> serialize_time_to_vector(
   return data;
 }
 
-std::chrono::steady_clock::time_point deserialize(
+static std::chrono::steady_clock::time_point deserialize(
     const std::vector<uint8_t>& data) {
   using namespace std::chrono;
 
@@ -173,7 +171,7 @@ struct EdgeDrone {
   // drone info
   uint8_t group_uuid;
   Vector3 position;
-  Vector3 velocity{1 * 0.005, 1 * 0.005, 0};
+  Vector3 velocity{1 * 0.1, 1 * 0.1, 0};
   uint8_t uuid;
   std::unordered_map<uint8_t,
                      std::chrono::time_point<std::chrono::steady_clock>>
@@ -291,5 +289,3 @@ struct EdgeDrone {
                 << std::endl;
   }
 };
-
-#endif
